@@ -1,0 +1,151 @@
+# plot_gaussian_t600.py
+#
+# Purpose
+#   Plot rho_ee(z) for the Gaussian advection test at t≈600 for both FV & FD outputs,
+#   together with the exact advected Gaussian.
+#
+# Assumptions
+#   - File tree (either spelling is OK; the script auto-picks the one that exists):
+#       output_from_fv_gaussiam/2000_1_0.2/rho_*.dat
+#       output_from_fd_gaussian/2000_1_0.2/rho_*.dat
+#   - job.config has keys: z0, z1, nz, nvz, dt
+#   - rho_n.dat columns: z, v, rho_ee, ...
+#
+# Exact
+#   f_exact(z, t) = A * exp(-(z - v * t)**2 / (2 * sigma**2))
+#   with A=1, sigma=50.  (v read from file; for t=600, v≈0.5 -> center ~300)
+
+import os, re, glob
+import numpy as np
+import matplotlib.pyplot as plt
+
+# ---------------- User settings ----------------
+JOB_ID     = "2000_1_0.2"
+TARGET_T   = 600.0
+GAUSS_A    = 1.0
+GAUSS_SIG  = 50.0
+SAVE_FIG   = "gaussian_rhoee_t600.png"
+
+# Accept both spellings; we’ll pick whichever exists on disk
+CANDIDATES = {
+    "FV + WENO7": ["output_from_fv_gaussiam", "output_from_fv_gaussian"],
+    "FD + KO3"  : ["output_from_fd_gaussian", "output_from_fd_gaussiam"],
+}
+
+# ---------------- Helpers ----------------
+def resolve_root(options):
+    """Return the first existing directory from 'options' or None."""
+    for d in options:
+        if os.path.isdir(d):
+            return d
+    return None
+
+def read_job_config(job_dir):
+    path = os.path.join(job_dir, "job.config")
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"job.config not found in {job_dir}")
+    raw = {}
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if ":" not in line: continue
+            k, v = line.split(":", 1)
+            k = k.strip(); v = v.strip()
+            try:
+                raw[k] = float(v) if any(c in v for c in ".eE") else int(v)
+            except ValueError:
+                raw[k] = v
+    out = {}
+    for key in ("z0","z1","nz","nvz","dt"):
+        if key not in raw: raise KeyError(f"'{key}' missing in {path}")
+        out[key] = float(raw[key]) if key in ("z0","z1","dt") else int(raw[key])
+    return out
+
+def list_rho_files(job_dir):
+    return sorted(glob.glob(os.path.join(job_dir, "rho_*.dat")))
+
+def rho_n_from_path(p):
+    m = re.search(r"rho_(\d+)\.dat$", os.path.basename(p))
+    return int(m.group(1)) if m else None
+
+def pick_best_snapshot(job_dir, dt, target_t):
+    files = list_rho_files(job_dir)
+    if not files: raise FileNotFoundError(f"No rho_*.dat in {job_dir}")
+    n0 = int(round(target_t/dt))
+    p0 = os.path.join(job_dir, f"rho_{n0}.dat")
+    if os.path.exists(p0): return p0, n0, n0*dt
+    cand = []
+    for p in files:
+        n = rho_n_from_path(p)
+        if n is None: continue
+        t = n*dt
+        cand.append((abs(t-target_t), p, n, t))
+    _, p, n, t = min(cand, key=lambda x: x[0])
+    return p, n, t
+
+def load_rho(path):
+    arr = np.loadtxt(path)
+    if arr.ndim != 2 or arr.shape[1] < 3:
+        raise ValueError(f"{path} has <3 columns.")
+    z = arr[:,0]
+    v = arr[:,1]
+    rho = arr[:,2]
+    return z, v[0], rho
+
+def exact_gaussian(z, t, v, A=GAUSS_A, sig=GAUSS_SIG):
+    return A * np.exp(- (z - v*t)**2 / (2.0 * sig**2))
+
+# ---------------- Main ----------------
+def main():
+    # Resolve roots that actually exist
+    roots = {}
+    for label, options in CANDIDATES.items():
+        root = resolve_root(options)
+        if root:
+            roots[label] = root
+        else:
+            print(f"[WARN] none of {options} exist; skipping {label}")
+
+    if not roots:
+        raise RuntimeError("No valid FV/FD gaussian output directories found.")
+
+    plt.figure(figsize=(9, 4.8))
+    for label, root in roots.items():
+        job_dir = os.path.join(root, JOB_ID)
+        if not os.path.isdir(job_dir):
+            print(f"[WARN] {job_dir} not found; skip {label}")
+            continue
+
+        # Config + choose snapshot near t=600
+        cfg = read_job_config(job_dir)
+        z0, z1, nz, dt = cfg["z0"], cfg["z1"], cfg["nz"], cfg["dt"]
+        path, n, t_act = pick_best_snapshot(job_dir, dt, TARGET_T)
+
+        # Load numerical
+        z, vbin, rho_num = load_rho(path)
+
+        # Exact gaussian with same velocity and time
+        rho_ex = exact_gaussian(z, t_act, vbin, GAUSS_A, GAUSS_SIG)
+
+        # Optional sanity: for t=600 we expect v≈0.5 so center ≈ 300
+        center = vbin * t_act
+        if abs(center - 300.0) > 5.0:
+            print(f"[NOTE] {label}: center≈{center:.2f} differs from 300 by >5; "
+                  f"(v={vbin:.3f}, t≈{t_act:.3f})")
+
+        # Plot
+        plt.plot(z, rho_num, lw=1.4, label=f"{label} (n={n}, t≈{t_act:.2f}, v={vbin:.2f})")
+    plt.plot(z, rho_ex,  "--", lw=1.0, alpha=0.8, label=f"Exact Gaussian — {label}")
+
+    plt.xlabel("z")
+    plt.ylabel(r"$\rho_{ee}$")
+    plt.title(r"Gaussian advection: $f(z,0)=\exp\!\left(-\frac{z^2}{2\cdot 50^2}\right)$; $t\approx600$")
+    plt.grid(True, alpha=0.3, linestyle=":")
+    plt.legend(fontsize=9)
+    plt.tight_layout()
+    plt.xlim(0, 600)
+    #plt.savefig(SAVE_FIG, dpi=220)
+    print(f"Saved figure to {SAVE_FIG}")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
